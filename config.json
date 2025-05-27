@@ -1,0 +1,9 @@
+{
+  "start_utc": 1747875600,
+  "end_utc": 1747876420,
+  "s3_prefix": "sevenau-green.cloudport.amagi.tv/sevenau/Recordings/processed/7bravo-sydney-source/amagistudio/RawTs/",
+  "aws_conf": {
+    "aws_region": "ap-southeast-1",
+    "s3_bucket": "aws-apse2-cprod-sydnm-amagilive"
+  }
+}

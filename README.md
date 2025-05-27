@@ -1,3 +1,4 @@
+
 # Input_Rec
 
 This Bash script downloads, processes, and merges video and audio segments from an AWS S3 bucket within a specified time range. Here's a breakdown of your documentation:
@@ -157,3 +158,97 @@ Merging: Merges the final .ts and .wav files into a single .mp4 file using ffmpe
 Cleanup: Moves all intermediate files to the trash using gio trash.
 Return to Original Directory: Changes back to the directory where the script was started.
 Completion Message: Prints a final message.
+=======
+# S3 ES Downloader & Parser
+
+A robust tool for downloading Elementary Stream (ES) files from AWS S3 and parsing them into Transport Stream (TS) files.
+
+## Features
+
+- **Parallel S3 Downloads**: Efficiently download multiple files concurrently
+- **Robust Error Handling**: Comprehensive error handling and retry mechanisms
+- **Resume Capability**: Resume interrupted downloads and parsing operations
+- **Progress Tracking**: Visual progress indicators and detailed logging
+- **Memory Efficient**: Buffered I/O for handling large files
+- **Configurable**: Extensive configuration options
+
+## Architecture
+
+The application is structured into several modules:
+
+- **main.py**: Entry point and orchestration
+- **config_manager.py**: Configuration loading and validation
+- **s3_reader.py**: S3 file listing and downloading
+- **es_parser.py**: ES file parsing and TS extraction
+- **utils.py**: Utility functions
+
+## Installation
+
+
+# Clone the repository
+git clone https://github.com/yourusername/s3-es-downloader.git
+cd s3-es-downloader
+
+# Install dependencies
+pip install -r requirements.txt
+
+
+## Usage
+python main.py config.json output.ts [options]
+### Command Line Options
+
+- `config.json`: Path to the configuration file
+- `output.ts`: Path for the output TS file
+- `--debug`, `-d`: Enable debug logging
+- `--resume`, `-r`: Resume from previous state if available
+- `--cleanup`, `-c`: Clean up temporary files after processing
+- `--temp-dir`, `-t`: Custom temporary directory path
+- `--buffer-size`, `-b`: Buffer size in bytes (default: 1MB)
+
+### Configuration File
+
+```json
+{
+  "start_utc": 1609459200,
+  "end_utc": 1609459300,
+  "s3_prefix": "path/to/prefix",
+  "aws_conf": {
+    "aws_region": "us-east-1",
+    "s3_bucket": "my-bucket"
+  }
+}
+```
+
+python main.py config.json output.ts
+## AWS Credentials
+
+The application uses the standard AWS credential providers:
+
+1. Environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`)
+2. Shared credential file (`~/.aws/credentials`)
+3. IAM role for EC2 instances
+
+**Note**: It's recommended to use environment variables or IAM roles instead of putting credentials in the configuration file.```
+.
+├── src/
+│   ├── __init__.py
+│   ├── main.py
+│   ├── config_manager.py
+│   ├── s3_reader.py
+│   ├── es_parser.py
+│   └── utils.py
+├── tests/
+│   ├── __init__.py
+│   ├── test_utils.py
+│   └── test_config_manager.py
+├── docs/
+│   └── architecture.png
+├── main.py
+├── config.json
+└── README.md
+```
+
+## License
+
+This project is licensed under the MIT License - see the LICENSE file for details.
+
