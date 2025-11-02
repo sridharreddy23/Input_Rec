@@ -23,6 +23,7 @@ var/
 # Virtual Environment
 venv/
 ENV/
+myenv/
 
 # IDE specific files
 .idea/
@@ -32,4 +33,5 @@ ENV/
 .ropeproject/
 
 # Large files
+*.ts
 *.tsInput_recording/

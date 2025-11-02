@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Main module for the ES Downloader and Parser.
+Main entry for ES Downloader & Parser with SendGB (Selenium) + authenticated GoFile fallback.
 """
 import os
 import sys
@@ -8,186 +8,378 @@ import argparse
 import logging
 import tempfile
 import signal
-import time
-from typing import Dict, Any
-
-import boto3
+from typing import Tuple, Optional
 from botocore.exceptions import ClientError
+import boto3
 
-from .utils import (
-    print_banner, print_section_header, print_final_success,
-    format_datetime, load_progress_state, log
-)
-from .config_manager import ConfigManager
-from .s3_reader import S3Reader
-from .es_parser import ESParser
+# --- Import project modules ---
+try:
+    from .utils import print_banner, print_section_header, print_final_success, format_datetime, load_progress_state, log
+    from .config_manager import ConfigManager
+    from .s3_reader import S3Reader
+    from .es_parser import ESParser
+except Exception:
+    from utils import print_banner, print_section_header, print_final_success, format_datetime, load_progress_state, log
+    from config_manager import ConfigManager
+    from s3_reader import S3Reader
+    from es_parser import ESParser
 
+# --- SendGB (Selenium) uploader ---
+try:
+    from .sendgb_selenium_uploader import upload_with_selenium
+except Exception:
+    try:
+        from sendgb_selenium_uploader import upload_with_selenium  # type: ignore
+    except Exception:
+        upload_with_selenium = None
+
+# --- GoFile authenticated uploader ---
+try:
+    from .gofile_uploader import upload_to_gofile
+except Exception:
+    from gofile_uploader import upload_to_gofile  # type: ignore
+
+# --- Helpers for link handling ---
+try:
+    from .sendgb_helpers import is_sendgb_link, validate_link_http, save_sendgb_link
+except Exception:
+    def is_sendgb_link(u: str) -> bool:
+        return bool(u and "sendgb.com" in u and "payment.sendgb.com" not in u)
+    def validate_link_http(u: str, timeout: int = 10):
+        return (True, 200)
+    def save_sendgb_link(out: str, link: str, filename_suffix: str = ".link.txt") -> str:
+        """Fallback implementation for saving upload links."""
+        path = out + filename_suffix
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(link.strip() + "\n")
+            log.debug(f"Link saved to {path}")
+        except (OSError, IOError) as e:
+            log.warning(f"Failed to save link to {path}: {e}")
+        return path
+
+
+# Global flag for graceful shutdown
+_shutdown_requested = False
+
+# --- Signal handler ---
 def signal_handler(sig, frame):
+    """Handle interruption signals for graceful shutdown."""
+    global _shutdown_requested
+    try:
+        signal_name = signal.Signals(sig).name
+    except (AttributeError, ValueError):
+        signal_name = f"SIG{sig}"
+    log.warning("\nProcess interrupted by user (%s). Cleaning up and exiting...", signal_name)
+    _shutdown_requested = True
+    # Allow some time for cleanup before force exit
+    import time
+    time.sleep(1)
+    sys.exit(130 if sig == signal.SIGINT else 128 + sig)
+
+
+# --- AWS setup ---
+def setup_aws_credentials(cfg: ConfigManager) -> None:
     """
-    Handle interrupt signals.
+    Configure AWS credentials from ConfigManager.
     
     Args:
-        sig: Signal number
-        frame: Current stack frame
+        cfg: ConfigManager instance containing AWS configuration
+        
+    Note:
+        This sets environment variables for boto3. Credentials in config file
+        will be used only if not already set in environment.
     """
-    log.warning("\n\nProcess interrupted by user. Exiting...")
-    # Perform any necessary cleanup here if needed (temp dirs usually handled by context managers)
-    sys.exit(0)
+    # Only set credentials from config if not already in environment
+    if not os.environ.get("AWS_ACCESS_KEY_ID"):
+        creds = cfg.get_aws_credentials()
+        if creds:
+            if creds.get("access_key"):
+                os.environ["AWS_ACCESS_KEY_ID"] = creds["access_key"]
+            if creds.get("secret_key"):
+                os.environ["AWS_SECRET_ACCESS_KEY"] = creds["secret_key"]
+            if creds.get("session_token"):
+                os.environ["AWS_SESSION_TOKEN"] = creds["session_token"]
+    
+    # Set region from config if not already set
+    if not os.environ.get("AWS_DEFAULT_REGION"):
+        region = cfg.get_aws_region()
+        if region:
+            os.environ["AWS_DEFAULT_REGION"] = region
+            log.debug(f"AWS region set to: {region}")
 
-def setup_aws_credentials(config_manager: ConfigManager):
+
+# --- Upload logic (SendGB → GoFile fallback) ---
+def attempt_sendgb_then_fallback(output_path: str, wait_timeout: int = 600) -> Tuple[str, str]:
     """
-    Set up AWS credentials from the configuration.
+    Attempt SendGB upload; if fails or payment link, fallback to GoFile.
     
     Args:
-        config_manager: Configuration manager
-    """
-    credentials = config_manager.get_aws_credentials()
-    if credentials:
-        if "access_key" in credentials:
-            os.environ["AWS_ACCESS_KEY_ID"] = credentials["access_key"]
-        if "secret_key" in credentials:
-            os.environ["AWS_SECRET_ACCESS_KEY"] = credentials["secret_key"]
-        if "session_token" in credentials:
-            os.environ["AWS_SESSION_TOKEN"] = credentials["session_token"]
+        output_path: Path to the file to upload
+        wait_timeout: Maximum seconds to wait for SendGB upload (default: 600)
     
-    region = config_manager.get_aws_region()
-    if region:
-        os.environ["AWS_DEFAULT_REGION"] = region
+    Returns:
+        Tuple of (provider_name, download_link)
+        
+    Raises:
+        RuntimeError: If both upload methods fail or GOFILE_TOKEN is missing
+        FileNotFoundError: If output_path doesn't exist
+    """
+    if not os.path.isfile(output_path):
+        raise FileNotFoundError(f"Output file not found: {output_path}")
+    
+    # 1️⃣ Try SendGB
+    if upload_with_selenium:
+        try:
+            log.info("Attempting SendGB upload...")
+            link = upload_with_selenium(output_path, wait_timeout=wait_timeout)
+            if is_sendgb_link(link):
+                ok, code = validate_link_http(link)
+                if ok:
+                    save_sendgb_link(output_path, link, filename_suffix=".sendgb_link.txt")
+                    log.info(f"SendGB link validated (HTTP {code})")
+                    return ("sendgb", link)
+                else:
+                    log.warning(f"SendGB link validation failed (HTTP {code}), falling back to GoFile.")
+            else:
+                log.warning("SendGB returned a payment or invalid link, falling back to GoFile.")
+        except KeyboardInterrupt:
+            raise  # Re-raise keyboard interrupts
+        except Exception as e:
+            log.warning("SendGB upload failed: %s", e, exc_info=log.isEnabledFor(logging.DEBUG))
 
-def main():
+    # 2️⃣ Fallback → GoFile
+    token = os.environ.get("GOFILE_TOKEN")
+    if not token:
+        raise RuntimeError("Missing GOFILE_TOKEN in environment. Export it before running.")
+    try:
+        log.info("Falling back to GoFile upload (authenticated).")
+        gofile_link = upload_to_gofile(output_path, api_token=token)
+        save_sendgb_link(output_path, gofile_link, filename_suffix=".gofile_link.txt")
+        return ("gofile", gofile_link)
+    except Exception as e:
+        log.exception("GoFile upload failed:")
+        raise RuntimeError(f"GoFile upload failed: {e}") from e
+
+
+def validate_arguments(args: argparse.Namespace) -> None:
     """
-    Main entry point for the ES Downloader and Parser.
+    Validate command-line arguments.
+    
+    Args:
+        args: Parsed command-line arguments
+        
+    Raises:
+        FileNotFoundError: If config file doesn't exist
+        ValueError: If arguments are invalid
     """
-    # Set up signal handler
+    # Validate config file exists
+    if not os.path.isfile(args.config):
+        raise FileNotFoundError(f"Configuration file not found: {args.config}")
+    
+    # Validate output path directory exists and is writable
+    output_dir = os.path.dirname(os.path.abspath(args.output))
+    if output_dir and not os.path.exists(output_dir):
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+            log.info(f"Created output directory: {output_dir}")
+        except (OSError, PermissionError) as e:
+            raise ValueError(f"Cannot create output directory {output_dir}: {e}") from e
+    elif output_dir and not os.access(output_dir, os.W_OK):
+        raise ValueError(f"Output directory is not writable: {output_dir}")
+    
+    # Validate sendgb-wait timeout
+    if args.sendgb_wait <= 0:
+        raise ValueError(f"--sendgb-wait must be positive, got {args.sendgb_wait}")
+
+
+def print_download_link(provider: str, link: str) -> None:
+    """
+    Print download link prominently to terminal.
+    
+    Args:
+        provider: Name of the upload provider (e.g., "GoFile", "SendGB")
+        link: The download link URL
+    """
+    try:
+        from colorama import Fore, Style
+    except ImportError:
+        # Fallback if colorama is not available
+        Fore = type('Fore', (), {'GREEN': '', 'YELLOW': '', 'CYAN': ''})()
+        Style = type('Style', (), {'RESET_ALL': ''})()
+    
+    # Calculate spacing for centered display
+    link_len = len(link)
+    padding = max(0, 68 - link_len - 2)
+    
+    print(f"\n{Fore.GREEN}{'=' * 70}")
+    print(f"{Fore.GREEN}╔{'═' * 68}╗")
+    print(f"{Fore.GREEN}║{Fore.YELLOW}  {provider} Download Link:{' ' * (68 - len(provider) - 18)}{Fore.GREEN}║")
+    print(f"{Fore.GREEN}║{' ' * 68}║")
+    print(f"{Fore.GREEN}║{Fore.CYAN}  {link}{' ' * padding}{Fore.GREEN}║")
+    print(f"{Fore.GREEN}╚{'═' * 68}╝")
+    print(f"{Fore.GREEN}{'=' * 70}{Style.RESET_ALL}\n")
+    # Also print just the link for easy copying
+    print(f"{Fore.CYAN}{link}{Style.RESET_ALL}\n")
+
+
+def handle_upload(output_path: str, args: argparse.Namespace) -> Optional[Tuple[str, str]]:
+    """
+    Handle file upload based on command-line arguments.
+    
+    Args:
+        output_path: Path to the file to upload
+        args: Parsed command-line arguments
+        
+    Returns:
+        Tuple of (provider, link) if upload succeeded, None otherwise
+    """
+    if args.gofile:
+        token = os.environ.get("GOFILE_TOKEN")
+        if not token:
+            raise RuntimeError("Missing GOFILE_TOKEN in environment.")
+        print_section_header("GoFile Upload")
+        link = upload_to_gofile(output_path, api_token=token)
+        # Print prominently to terminal
+        print_download_link("GoFile", link)
+        # Optionally save to file (user can disable if needed)
+        try:
+            save_sendgb_link(output_path, link, filename_suffix=".gofile_link.txt")
+            log.debug(f"Link also saved to {output_path}.gofile_link.txt")
+        except Exception as e:
+            log.debug(f"Could not save link to file: {e}")
+        return ("gofile", link)
+    elif args.sendgb:
+        print_section_header("SendGB Upload")
+        provider, link = attempt_sendgb_then_fallback(output_path, wait_timeout=args.sendgb_wait)
+        # Print prominently to terminal
+        print_download_link(provider.capitalize(), link)
+        # Optionally save to file
+        try:
+            save_sendgb_link(output_path, link, filename_suffix=f".{provider.lower()}_link.txt")
+            log.debug(f"Link also saved to {output_path}.{provider.lower()}_link.txt")
+        except Exception as e:
+            log.debug(f"Could not save link to file: {e}")
+        return (provider, link)
+    else:
+        log.info("No upload option requested (--sendgb or --gofile).")
+        return None
+
+
+# --- Main function ---
+def main() -> int:
+    """
+    Main entry point for the ES Downloader & Parser.
+    
+    Returns:
+        Exit code (0 for success, non-zero for failure)
+    """
+    # Register signal handlers for graceful shutdown
     signal.signal(signal.SIGINT, signal_handler)
+    if hasattr(signal, 'SIGTERM'):
+        signal.signal(signal.SIGTERM, signal_handler)
     
-    # Parse command line arguments
     parser = argparse.ArgumentParser(
-        description="S3 ES Downloader & Parser v3.0",
+        description="S3 ES Downloader & Parser + SendGB/GoFile uploader",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Example: python -m src.main config.json /path/to/output.ts"
+        epilog="""
+Examples:
+  %(prog)s config.json output.ts --gofile
+  %(prog)s config.json output.ts --sendgb --sendgb-wait 300
+        """
     )
-    parser.add_argument('config', help="Path to the configuration JSON file")
-    parser.add_argument('output', help="Path for the final concatenated TS output file")
-    parser.add_argument('--debug', '-d', action='store_true', help="Enable debug logging")
-    parser.add_argument('--resume', '-r', action='store_true', help="Resume from previous state if available")
-    parser.add_argument('--cleanup', '-c', action='store_true', help="Clean up temporary files after processing")
-    parser.add_argument('--temp-dir', '-t', help="Custom temporary directory path")
-    parser.add_argument('--buffer-size', '-b', type=int, default=1024*1024, help="Buffer size in bytes (default: 1MB)")
-
-    if len(sys.argv) == 1:  # No arguments provided
-        print_banner()
-        parser.print_help(sys.stderr)
-        sys.exit(1)
-
+    parser.add_argument("config", help="Path to configuration JSON file")
+    parser.add_argument("output", help="Final TS output file path")
+    parser.add_argument("--sendgb", action="store_true", 
+                       help="Try SendGB upload (fallback to GoFile on fail)")
+    parser.add_argument("--gofile", action="store_true", 
+                       help="Upload final TS directly to GoFile")
+    parser.add_argument("--sendgb-wait", type=int, default=600, 
+                       help="Seconds to wait for SendGB upload (default: 600)")
+    parser.add_argument("--debug", "-d", action="store_true", 
+                       help="Enable debug logs")
     args = parser.parse_args()
 
+    # Setup logging
     if args.debug:
         log.setLevel(logging.DEBUG)
-        log.info("Debug logging enabled.")
+        logging.getLogger("boto3").setLevel(logging.DEBUG)
+        logging.getLogger("botocore").setLevel(logging.DEBUG)
+        log.info("Debug logging enabled")
 
-    print_banner()  # Show banner after potential debug enabling
+    print_banner()
 
     try:
-        # --- Load Configuration ---
-        config_manager = ConfigManager(args.config)
-        start_utc = config_manager.get_start_utc()
-        end_utc = config_manager.get_end_utc()
-        full_s3_prefix = config_manager.get_s3_prefix()
-        output_filepath = args.output
+        # Validate arguments
+        validate_arguments(args)
         
-        # Set up AWS credentials
-        setup_aws_credentials(config_manager)
+        # Load and validate configuration
+        cfg = ConfigManager(args.config)
+        setup_aws_credentials(cfg)
 
-        print_section_header("Processing Setup")
-        log.info(f"Input Config: {args.config}")
-        log.info(f"Output File: {output_filepath}")
-        log.info(f"Time Range: {format_datetime(start_utc)} -> {format_datetime(end_utc)}")
-        log.info(f"Target S3 Prefix: {full_s3_prefix}")
-        log.info(f"Buffer Size: {args.buffer_size / 1024:.1f} KiB")
-        
-        # Set up resume state file if resuming
-        resume_state_file = None
-        if args.resume:
-            resume_state_file = f"{output_filepath}.state"
-            log.info(f"Resume state file: {resume_state_file}")
-        
-        # Load previous state if resuming
-        previous_state = None
-        if args.resume and os.path.exists(f"{output_filepath}.state"):
-            previous_state = load_progress_state(f"{output_filepath}.state")
-            if previous_state:
-                log.info(f"Found previous state from {time.ctime(previous_state.get('timestamp', 0))}")
-                
-                # Check if the previous run was completed
-                if previous_state.get("completed", False):
-                    log.info("Previous run was completed successfully. Nothing to do.")
-                    print_final_success()
-                    return 0
+        start_utc, end_utc = cfg.get_start_utc(), cfg.get_end_utc()
+        s3_prefix = cfg.get_s3_prefix()
+        output_path = args.output
 
-        # --- Create Temporary Directory ---
-        temp_dir_context = None
-        if args.temp_dir:
-            # Use custom temp directory
-            temp_dir = args.temp_dir
-            os.makedirs(temp_dir, exist_ok=True)
-            log.info(f"Using custom temporary directory: {temp_dir}")
-        else:
-            # Use auto-cleanup temporary directory
-            temp_dir_context = tempfile.TemporaryDirectory(prefix="s3_es_parser_")
-            temp_dir = temp_dir_context.name
-            log.info(f"Using temporary directory for downloads: {temp_dir}")
+        print_section_header("Setup")
+        log.info(f"Config: {args.config}")
+        log.info(f"Output: {output_path}")
+        log.info(f"Range: {format_datetime(start_utc)} -> {format_datetime(end_utc)}")
+        log.info(f"S3 prefix: {s3_prefix}")
 
-        try:
-            # --- Step 1: Download Files ---
-            s3_reader = S3Reader(start_utc, end_utc, full_s3_prefix, temp_dir, resume_state_file)
+        # Check for shutdown request
+        if _shutdown_requested:
+            log.warning("Shutdown requested before processing")
+            return 130
+
+        with tempfile.TemporaryDirectory(prefix="s3_es_parser_") as temp_dir:
+            log.debug(f"Using temporary directory: {temp_dir}")
             
-            # Resume from previous state if available
-            if previous_state and "downloaded_files" in previous_state:
-                s3_reader.resume_from_state(previous_state)
-            
-            available_files = s3_reader.download_files_parallel()
-
-            if not available_files:
-                log.error("No files were available for parsing. Exiting.")
+            # Download
+            print_section_header("Downloading from S3")
+            s3_reader = S3Reader(start_utc, end_utc, s3_prefix, temp_dir, None)
+            files = s3_reader.download_files_parallel()
+            if not files:
+                log.error("No files available for parsing. Exiting.")
                 return 1
 
-            # --- Step 2: Parse Files ---
-            es_parser = ESParser(start_utc, end_utc, output_filepath, args.buffer_size, resume_state_file)
-            
-            # Resume parsing from previous state if available
-            if previous_state and "total_packets_processed" in previous_state:
-                es_parser.resume_from_state(previous_state)
-            
-            es_parser.process_files(available_files, cleanup_after_processing=args.cleanup)
-        finally:
-            # If using a context manager for temp_dir, it will be cleaned up automatically
-            if temp_dir_context:
-                log.info(f"Cleaning up temporary directory: {temp_dir}")
-            elif args.cleanup:
-                log.info(f"Keeping custom temporary directory: {temp_dir}")
+            if _shutdown_requested:
+                log.warning("Shutdown requested after download")
+                return 130
 
-        # --- Final Success ---
+            # Parse
+            print_section_header("Parsing ES Files")
+            es_parser = ESParser(start_utc, end_utc, output_path, 1024 * 1024, None)
+            es_parser.process_files(files, cleanup_after_processing=False)
+            
+            if not os.path.isfile(output_path):
+                raise FileNotFoundError(f"Expected output file not created: {output_path}")
+
+            if _shutdown_requested:
+                log.warning("Shutdown requested after parsing")
+                return 130
+
+            # Upload
+            handle_upload(output_path, args)
+
         print_final_success()
-        log.info("Script finished successfully.")
+        log.info("All done successfully.")
         return 0
 
-    except FileNotFoundError as e:
-        log.error(f"File not found: {e}")
-        return 1
-    except PermissionError as e:
-        log.error(f"Permission error: {e}")
-        return 1
-    except ClientError as e:
-        log.error(f"AWS Client Error: {e}", exc_info=args.debug)  # Show trace only in debug
-        return 1
     except KeyboardInterrupt:
-        # Already handled by signal handler, but catch here just in case
-        log.warning("Operation cancelled by user (KeyboardInterrupt).")
+        log.warning("\nProcess interrupted by user")
+        return 130
+    except (FileNotFoundError, ValueError) as e:
+        log.error(f"Configuration error: {e}")
+        return 1
+    except RuntimeError as e:
+        log.error(f"Runtime error: {e}")
         return 1
     except Exception as e:
-        log.exception("An unexpected fatal error occurred:")  # Log full traceback
+        log.exception("Fatal error:")
         return 1
+
 
 if __name__ == "__main__":
     sys.exit(main())
+
